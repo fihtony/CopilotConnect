@@ -1,7 +1,7 @@
 {
   "name": "copilot-connect",
   "displayName": "Copilot Connect (Copilot信使)",
-  "description": "A local HTTP bridge to GitHub Copilot. Exposes REST API endpoints for chat, models, and session management with real-time streaming support. Now with OpenAI API compatible endpoints.",
+  "description": "A local HTTP bridge to GitHub Copilot with OpenAI-compatible API endpoints.",
   "version": "1.2.0",
   "publisher": "tonyxu",
   "author": {
@@ -111,20 +111,20 @@
     "watch": "tsc -p ./ -w",
     "package": "vsce package",
     "start:dev": "ts-node src/server-runner.ts",
-    "start:dev:watch": "nodemon --watch src -e ts --exec \"ts-node src/server-runner.ts\""
+    "start:dev:watch": "nodemon --watch src -e ts --exec \"ts-node src/server-runner.ts\"",
+    "test": "node --test tests/**/*.test.ts",
+    "test:dev": "node --test --watch tests/**/*.test.ts"
   },
   "devDependencies": {
     "@types/express": "^4.17.17",
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.90.0",
-    "@types/uuid": "^9.0.0",
     "typescript": "^5.0.0",
     "vsce": "^2.0.0",
     "ts-node": "^10.9.1",
     "nodemon": "^2.0.22"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "uuid": "^9.0.0"
+    "express": "^4.18.2"
   }
 }
