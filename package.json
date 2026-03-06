@@ -1,0 +1,130 @@
+{
+  "name": "copilot-connect",
+  "displayName": "Copilot Connect (Copilot信使)",
+  "description": "A local HTTP bridge to GitHub Copilot. Exposes REST API endpoints for chat, models, and session management with real-time streaming support. Now with OpenAI API compatible endpoints.",
+  "version": "1.2.0",
+  "publisher": "tonyxu",
+  "author": {
+    "name": "Tony Xu",
+    "email": "tony@tarch.ca"
+  },
+  "license": "MIT",
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "connect",
+    "bridge",
+    "api",
+    "http",
+    "rest",
+    "openai",
+    "openai-compatible",
+    "langchain",
+    "llamaindex"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fihtony/copilot-connect"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilotConnect.toggleMenu",
+        "title": "Copilot Connect: Open Menu"
+      },
+      {
+        "command": "copilotConnect.start",
+        "title": "Copilot Connect: Start Bridge"
+      },
+      {
+        "command": "copilotConnect.stop",
+        "title": "Copilot Connect: Stop Bridge"
+      },
+      {
+        "command": "copilotConnect.changePort",
+        "title": "Copilot Connect: Change Port"
+      },
+      {
+        "command": "copilotConnect.selectDefaultModel",
+        "title": "Copilot Connect: Select Default Model"
+      },
+      {
+        "command": "copilotConnect.setAdditionalContext",
+        "title": "Copilot Connect: Set Additional Context"
+      },
+      {
+        "command": "copilotConnect.changeLanguage",
+        "title": "Copilot Connect: Change Language"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "copilotConnect.toggleMenu",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Copilot Connect",
+      "properties": {
+        "copilotConnect.port": {
+          "type": "number",
+          "default": 1288,
+          "description": "Port number for the bridge server"
+        },
+        "copilotConnect.defaultModel": {
+          "type": "string",
+          "default": "",
+          "description": "Default language model ID to use (empty for auto-select)"
+        },
+        "copilotConnect.additionalContext": {
+          "type": "string",
+          "default": "",
+          "description": "Additional context to prepend to all requests"
+        },
+        "copilotConnect.language": {
+          "type": "string",
+          "default": "en",
+          "enum": [
+            "en",
+            "zh"
+          ],
+          "description": "Language preference (en: English, zh: 中文)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -p ./ -w",
+    "package": "vsce package",
+    "start:dev": "ts-node src/server-runner.ts",
+    "start:dev:watch": "nodemon --watch src -e ts --exec \"ts-node src/server-runner.ts\""
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.17",
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.90.0",
+    "@types/uuid": "^9.0.0",
+    "typescript": "^5.0.0",
+    "vsce": "^2.0.0",
+    "ts-node": "^10.9.1",
+    "nodemon": "^2.0.22"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "uuid": "^9.0.0"
+  }
+}

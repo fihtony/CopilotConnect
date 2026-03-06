@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+
+venv/
+.venv/
+
+# VS Code extension packages
+*.vsix
+
+# Logs
+tests/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# TypeScript
+*.tsbuildinfo
+
+# Test artifacts
+.nyc_output/
+coverage/
+
+# Temporary files
+*.tmp
+*.bak
+*~
