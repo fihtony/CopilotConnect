@@ -10,8 +10,6 @@ out/
 venv/
 .venv/
 
-# VS Code extension packages
-*.vsix
 
 # Logs
 *.log
