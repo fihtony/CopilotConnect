@@ -28,7 +28,7 @@ async function makeRequest(baseUrl: string, path: string, method = "GET", body?:
 
 test("health endpoint returns correct status", async (t) => {
   const TEST_PORT = getTestPort();
-  const stopBridge = await startBridge(TEST_PORT);
+  const bridge = await startBridge(TEST_PORT);
   const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
 
   try {
@@ -39,20 +39,21 @@ test("health endpoint returns correct status", async (t) => {
     assert.strictEqual(data.status, "ok");
     assert.strictEqual(data.port, TEST_PORT);
     assert.strictEqual(typeof data.version, "string");
+    assert.ok(data.mode === "echo" || data.mode === "bridge", `mode should be echo or bridge, got: ${data.mode}`);
   } finally {
-    await stopBridge();
+    bridge.stop();
   }
 });
 
 test("health endpoint returns 200 status code", async (t) => {
   const TEST_PORT = getTestPort();
-  const stopBridge = await startBridge(TEST_PORT);
+  const bridge = await startBridge(TEST_PORT);
   const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
 
   try {
     const response = await makeRequest(baseUrl, "/health");
     assert.strictEqual(response.status, 200);
   } finally {
-    await stopBridge();
+    bridge.stop();
   }
 });

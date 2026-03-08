@@ -7,15 +7,17 @@ A VS Code extension that exposes GitHub Copilot through a local HTTP server with
 - Local HTTP server for Copilot (default port: 1288)
 - OpenAI-compatible `/v1/models` endpoint for model discovery
 - OpenAI-compatible `/v1/chat/completions` endpoint with streaming support
-- Stateless API design compatible with OpenAI clients
-- Health check endpoint for monitoring
-- VS Code status bar integration for easy management
+- Tool calling support (`tools` / `tool_choice` parameters)
+- **Echo mode** — test integrations without consuming real Copilot requests
+- Health check endpoint with current mode and version
+- `GET/POST /v1/mode` endpoint for programmatic Echo/Bridge switching
+- VS Code status bar integration (dark orange = Echo mode)
 
 ## Installation
 
 ### From VSIX (recommended)
 
-1. Build or obtain `copilot-connect-1.2.0.vsix`
+1. Build or obtain `copilot-connect-1.3.1.vsix`
 2. In VS Code: `Cmd+Shift+P` → `Extensions: Install from VSIX...` → select the VSIX file
 3. Reload window: `Cmd+Shift+P` → `Developer: Reload Window`
 
@@ -24,7 +26,7 @@ A VS Code extension that exposes GitHub Copilot through a local HTTP server with
 ```bash
 npm install
 npm run compile
-npm run package   # creates copilot-connect-1.2.0.vsix
+npm run package   # creates copilot-connect-1.3.1.vsix
 ```
 
 Note: After installing or updating the extension you must reload the VS Code window.
@@ -45,6 +47,7 @@ Base URL: `http://localhost:1288`
 
 ```bash
 curl http://localhost:1288/health
+# {"status":"ok","port":1288,"version":"1.3.1","mode":"bridge"}
 ```
 
 ### List Models
@@ -102,9 +105,37 @@ Returns SSE stream with OpenAI format chunks ending with `data: [DONE]`.
 ### Supported Parameters
 
 - `messages` (required): Array of message objects with `role` and `content`
-- `model` (optional): Model ID to use
-- `stream` (optional): Set to `true` for streaming responses
-- `temperature`, `max_tokens`, `top_p`, `frequency_penalty`, `presence_penalty`, `stop`, `n` (accepted but may not affect behavior)
+- `model` (optional): Model ID to use (see `GET /v1/models` for available IDs)
+- `stream` (optional): Set to `true` for SSE streaming responses
+- `stream_options` (optional): `{"include_usage":true}` appends a usage chunk before `[DONE]`
+- `n` (optional): Number of independent completions to return
+- `response_format` (optional): `{"type":"json_object"}` enforces JSON output
+- `tools` / `tool_choice` (optional): Function calling (supported by `gpt-4o`, `gpt-4.1`)
+- `temperature`, `max_tokens`, `max_completion_tokens`, `top_p`, `stop` (forwarded; partial effect)
+
+## Echo Mode
+
+Echo mode returns a `[Echo] <user message>` response with the **same JSON/SSE structure** as a
+real reply — no Copilot tokens consumed. Useful for testing integrations.
+
+```bash
+# Enable echo mode
+curl -X POST http://localhost:1288/v1/mode \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"echo"}'
+
+# Check current mode
+curl http://localhost:1288/v1/mode
+
+# Disable echo mode (return to bridge)
+curl -X POST http://localhost:1288/v1/mode \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"bridge"}'
+```
+
+Alternatively: status bar menu → _Switch to Echo Mode_, or Command Palette → `Copilot Connect: Toggle Echo Mode`.
+
+The status bar turns **dark orange** while Echo mode is active. The extension always starts in Bridge mode.
 
 ## Configuration
 
@@ -143,4 +174,4 @@ Tony Xu — tony@tarch.ca
 
 ## Version
 
-1.2.0
+1.3.1

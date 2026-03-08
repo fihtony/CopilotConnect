@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { startBridge } from "./server";
+import { startBridge, BridgeControl, ChatMessage, ChatResult, RequestOptions, StreamChunkDelta, UsageInfo } from "./server";
 
 // Read version from package.json
 const packageJson = require("../package.json");
@@ -9,6 +9,8 @@ let serverDisposable: vscode.Disposable | undefined;
 let statusBarItem: vscode.StatusBarItem;
 let isRunning = false;
 let currentPort = 1288;
+let echoMode = false;
+let bridgeControl: BridgeControl | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   console.log("[CopilotConnect] Activating...");
@@ -37,6 +39,8 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(vscode.commands.registerCommand("copilotConnect.changeLanguage", () => changeLanguage()));
 
+  context.subscriptions.push(vscode.commands.registerCommand("copilotConnect.toggleEchoMode", () => toggleEchoMode()));
+
   // Auto-start the bridge
   startServer(context);
 }
@@ -45,15 +49,22 @@ function updateStatusBar() {
   const config = vscode.workspace.getConfiguration("copilotConnect");
   const language = config.get<string>("language", "en");
 
+  const text = language === "zh" ? `Copilot信使` : `Copilot Connect`;
   if (isRunning) {
-    const text = language === "zh" ? `Copilot信使: 运行中, 端口` : `Copilot Connect: Running Port`;
-    statusBarItem.text = `$(radio-tower) ${text}: ${currentPort}`;
-    statusBarItem.tooltip = language === "zh" ? "点击打开Copilot信使菜单" : "Click to open Copilot Connect menu";
-    statusBarItem.backgroundColor = undefined;
-    statusBarItem.color = undefined;
+    if (echoMode) {
+      statusBarItem.text = `$(record) ${text} Echo: ${currentPort}`;
+      statusBarItem.tooltip =
+        language === "zh" ? "Echo模式已激活（不发送真实请求）- 点击打开菜单" : "Echo mode active (no real requests) — Click to open menu";
+      statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+      statusBarItem.color = undefined;
+    } else {
+      statusBarItem.text = `$(radio-tower) ${text}: ${currentPort}`;
+      statusBarItem.tooltip = language === "zh" ? "桥接模式 - 点击打开Copilot信使菜单" : "Bridge mode — Click to open Copilot Connect menu";
+      statusBarItem.backgroundColor = undefined;
+      statusBarItem.color = undefined;
+    }
   } else {
-    const text = language === "zh" ? `Copilot信使: 已停止` : `Copilot Connect: Stopped`;
-    statusBarItem.text = `$(circle-slash) ${text}`;
+    statusBarItem.text = `$(circle-slash) ${text}: ${language === "zh" ? "已停止" : "Stopped"}`;
     statusBarItem.tooltip = language === "zh" ? "点击打开Copilot信使菜单" : "Click to open Copilot Connect menu";
     statusBarItem.backgroundColor = undefined;
     statusBarItem.color = new vscode.ThemeColor("statusBar.foreground");
@@ -97,8 +108,8 @@ async function showMenu(context: vscode.ExtensionContext) {
           ? "$(debug-stop) 停止信使服务"
           : "$(debug-stop) Stop Copilot Connect"
         : zh
-        ? "$(debug-start) 启动信使服务"
-        : "$(debug-start) Start Copilot Connect",
+          ? "$(debug-start) 启动信使服务"
+          : "$(debug-start) Start Copilot Connect",
       description: isRunning ? (zh ? "停止信使服务" : "Stop Copilot Connect") : zh ? "启动信使服务" : "Start Copilot Connect",
     },
     {
@@ -116,6 +127,22 @@ async function showMenu(context: vscode.ExtensionContext) {
     {
       label: zh ? "$(globe) 更改语言" : "$(globe) Change Language",
       description: `${zh ? "当前" : "Current"}: ${zh ? "中文" : "English"}`,
+    },
+    {
+      label: echoMode
+        ? zh
+          ? "$(radio-tower) 切换到桥接模式"
+          : "$(radio-tower) Switch to Bridge Mode"
+        : zh
+          ? "$(record) 切换到Echo模式"
+          : "$(record) Switch to Echo Mode",
+      description: echoMode
+        ? zh
+          ? "停止Echo，连接真实Copilot"
+          : "Stop echoing, connect to real Copilot"
+        : zh
+          ? "启用Echo模式（不发送真实请求）"
+          : "Enable echo mode (no real requests sent)",
     },
   ];
 
@@ -144,6 +171,13 @@ async function showMenu(context: vscode.ExtensionContext) {
     setAdditionalContext();
   } else if (selected.label.includes("Language") || selected.label.includes("语言")) {
     changeLanguage();
+  } else if (
+    selected.label.includes("Echo") ||
+    selected.label.includes("Bridge Mode") ||
+    selected.label.includes("桥接模式") ||
+    selected.label.includes("Echo模式")
+  ) {
+    toggleEchoMode();
   }
 }
 
@@ -173,52 +207,182 @@ async function startServer(context: vscode.ExtensionContext) {
     }
   };
 
-  // Chat handler using VS Code Language Model API
-  const chatHandler = async (prompt: string, context: string | null, modelId: string | null) => {
-    try {
-      // Use default model if specified and no modelId provided
-      const effectiveModelId = modelId || defaultModel || null;
-      const effectiveContext = additionalContext ? `${additionalContext}\n\n${context || ""}` : context;
+  /**
+   * Resolve the best VS Code LanguageModelChat for the given model id.
+   * Falls back to any copilot model if the exact id is not found.
+   */
+  async function resolveModel(modelId: string | null): Promise<vscode.LanguageModelChat> {
+    const effectiveId = modelId || defaultModel || null;
+    const selector = effectiveId ? { id: effectiveId } : { vendor: "copilot" };
+    let models = await vscode.lm.selectChatModels(selector);
 
-      // Select model - prefer specified modelId, otherwise use vendor filter
-      const selector = effectiveModelId ? { id: effectiveModelId } : { vendor: "copilot" };
-      let models = await vscode.lm.selectChatModels(selector);
+    if (models.length === 0 && effectiveId) {
+      console.warn(`[CopilotConnect] No model found for "${effectiveId}", falling back to copilot default`);
+      models = await vscode.lm.selectChatModels({ vendor: "copilot" });
+    }
+    if (models.length === 0) {
+      throw new Error("No matching language model found. Make sure GitHub Copilot is installed and signed in.");
+    }
 
-      // If no models found with specific ID, fallback to any copilot model
-      if (models.length === 0 && effectiveModelId) {
-        console.warn(`[CopilotConnect] No model found for ${effectiveModelId}, falling back to default copilot models`);
-        models = await vscode.lm.selectChatModels({ vendor: "copilot" });
+    const exactMatch = effectiveId ? models.find((m) => m.id === effectiveId) : undefined;
+    const selected = exactMatch ?? models[0];
+    console.log(`[CopilotConnect] Model selected: ${selected.id} (${selected.name})`);
+    return selected;
+  }
+
+  /**
+   * Convert OpenAI-format ChatMessage[] to vscode.LanguageModelChatMessage[].
+   * - System messages are prepended to the next user message.
+   * - Tool messages (role="tool") become User messages with a ToolResultPart.
+   * - Assistant messages with tool_calls use LanguageModelToolCallPart.
+   * - If response_format is json_object, a JSON instruction is prepended.
+   */
+  function convertMessages(
+    messages: ChatMessage[],
+    extraContext: string | undefined,
+    responseFormat?: { type: string },
+  ): vscode.LanguageModelChatMessage[] {
+    const result: vscode.LanguageModelChatMessage[] = [];
+    const pendingSystem: string[] = [];
+
+    if (extraContext) pendingSystem.push(extraContext);
+    if (responseFormat?.type === "json_object") {
+      pendingSystem.push("You must respond with valid JSON only. Do not include any prose or markdown fences.");
+    }
+
+    for (const msg of messages) {
+      if (msg.role === "system") {
+        pendingSystem.push(msg.content ?? "");
+        continue;
       }
 
-      if (models.length === 0) {
-        throw new Error("No matching language model found");
+      if (msg.role === "user") {
+        let text = msg.content ?? "";
+        if (pendingSystem.length > 0) {
+          text = pendingSystem.join("\n\n") + "\n\n" + text;
+          pendingSystem.length = 0;
+        }
+        result.push(vscode.LanguageModelChatMessage.User(text));
+        continue;
       }
 
-      // Ensure we use the correct model - find exact match if modelId specified
-      let selectedModel = models[0];
-      if (effectiveModelId && models.length > 0) {
-        const exactMatch = models.find((m) => m.id === effectiveModelId);
-        if (exactMatch) {
-          selectedModel = exactMatch;
+      if (msg.role === "assistant") {
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          const parts: Array<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart> = [];
+          if (msg.content) {
+            parts.push(new vscode.LanguageModelTextPart(msg.content));
+          }
+          for (const tc of msg.tool_calls) {
+            let input: object = {};
+            try {
+              input = JSON.parse(tc.function.arguments);
+            } catch {
+              // leave as empty object
+            }
+            parts.push(new vscode.LanguageModelToolCallPart(tc.id, tc.function.name, input));
+          }
+          result.push(vscode.LanguageModelChatMessage.Assistant(parts));
         } else {
-          console.warn(`[CopilotConnect] ChatHandler: No exact match for ${effectiveModelId}, using first model: ${models[0].name}`);
+          result.push(vscode.LanguageModelChatMessage.Assistant(msg.content ?? ""));
+        }
+        continue;
+      }
+
+      if (msg.role === "tool") {
+        // Tool result must be wrapped in a User message
+        const toolResultPart = new vscode.LanguageModelToolResultPart(msg.tool_call_id ?? "", [
+          new vscode.LanguageModelTextPart(msg.content ?? ""),
+        ]);
+        result.push(vscode.LanguageModelChatMessage.User([toolResultPart]));
+        continue;
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Build VS Code LanguageModelChatRequestOptions from OpenAI RequestOptions.
+   */
+  function buildVsCodeOptions(opts: RequestOptions): vscode.LanguageModelChatRequestOptions {
+    // Convert OpenAI tools to VS Code LanguageModelChatTool format
+    let vsCodeTools: vscode.LanguageModelChatTool[] | undefined;
+    let toolMode: vscode.LanguageModelChatToolMode | undefined;
+
+    if (opts.tools && opts.tools.length > 0 && opts.tool_choice !== "none") {
+      vsCodeTools = opts.tools.map((t) => ({
+        name: t.function.name,
+        description: t.function.description ?? "",
+        inputSchema: t.function.parameters,
+      }));
+
+      if (opts.tool_choice === "required") {
+        toolMode = vscode.LanguageModelChatToolMode.Required;
+      } else {
+        // "auto" or object (specific function) – use Auto; VS Code doesn't support forcing a specific tool
+        toolMode = vscode.LanguageModelChatToolMode.Auto;
+      }
+    }
+
+    // Build modelOptions with all supported sampling parameters (undefined values are omitted)
+    const modelOpts: Record<string, unknown> = {};
+    if (opts.temperature !== undefined) modelOpts.temperature = opts.temperature;
+    if (opts.top_p !== undefined) modelOpts.top_p = opts.top_p;
+    const tokenLimit = opts.max_completion_tokens ?? opts.max_tokens;
+    if (tokenLimit !== undefined) modelOpts.max_tokens = tokenLimit;
+    if (opts.stop !== undefined) modelOpts.stop = opts.stop;
+    if (opts.seed !== undefined) modelOpts.seed = opts.seed;
+    if (opts.presence_penalty !== undefined) modelOpts.presence_penalty = opts.presence_penalty;
+    if (opts.frequency_penalty !== undefined) modelOpts.frequency_penalty = opts.frequency_penalty;
+    if (opts.logit_bias !== undefined) modelOpts.logit_bias = opts.logit_bias;
+
+    const vsCodeOpts: vscode.LanguageModelChatRequestOptions = {
+      modelOptions: Object.keys(modelOpts).length > 0 ? modelOpts : undefined,
+    };
+    if (vsCodeTools) vsCodeOpts.tools = vsCodeTools;
+    if (toolMode !== undefined) vsCodeOpts.toolMode = toolMode;
+    return vsCodeOpts;
+  }
+
+  // Chat handler using VS Code Language Model API
+  const chatHandler = async (
+    messages: ChatMessage[],
+    modelId: string | null,
+    options: RequestOptions,
+  ): Promise<import("./server").ChatResult> => {
+    try {
+      const model = await resolveModel(modelId);
+      const vsCodeMessages = convertMessages(messages, additionalContext || undefined, options.response_format);
+      const vsCodeOptions = buildVsCodeOptions(options);
+
+      const chatResponse = await model.sendRequest(vsCodeMessages, vsCodeOptions, new vscode.CancellationTokenSource().token);
+
+      let content = "";
+      const toolCalls: import("./server").ToolCall[] = [];
+      let toolCallIndex = 0;
+
+      for await (const part of chatResponse.stream) {
+        if (part instanceof vscode.LanguageModelTextPart) {
+          content += part.value;
+        } else if (part instanceof vscode.LanguageModelToolCallPart) {
+          toolCalls.push({
+            id: part.callId,
+            type: "function",
+            function: {
+              name: part.name,
+              arguments: JSON.stringify(part.input),
+            },
+          });
+          toolCallIndex++;
         }
       }
 
-      const [model] = [selectedModel];
-      console.log(`[CopilotConnect] ChatHandler: model selected: ${model.id}(${model.name})`);
-
-      // Prepare messages
-      const messages = [vscode.LanguageModelChatMessage.User(effectiveContext ? `${effectiveContext}\n\n${prompt}` : prompt)];
-
-      const chatResponse = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
-
-      let fullResponse = "";
-      for await (const fragment of chatResponse.text) {
-        fullResponse += fragment;
-      }
-
-      return fullResponse;
+      const result: import("./server").ChatResult = {
+        content: content || null,
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
+      };
+      if (toolCalls.length > 0) result.tool_calls = toolCalls;
+      return result;
     } catch (err: any) {
       console.error("[CopilotConnect] Chat request failed:", err);
       throw err;
@@ -226,45 +390,54 @@ async function startServer(context: vscode.ExtensionContext) {
   };
 
   // Stream chat handler using VS Code Language Model API
-  const streamChatHandler = async (prompt: string, context: string | null, modelId: string | null, onChunk: (chunk: string) => void) => {
+  const streamChatHandler = async (
+    messages: ChatMessage[],
+    modelId: string | null,
+    options: RequestOptions,
+    onChunk: (delta: StreamChunkDelta) => void,
+  ): Promise<{ usage?: UsageInfo; finish_reason?: string }> => {
     try {
-      const effectiveModelId = modelId || defaultModel || null;
-      const effectiveContext = additionalContext ? `${additionalContext}\n\n${context || ""}` : context;
+      const model = await resolveModel(modelId);
+      const vsCodeMessages = convertMessages(messages, additionalContext || undefined, options.response_format);
+      const vsCodeOptions = buildVsCodeOptions(options);
 
-      const selector = effectiveModelId ? { id: effectiveModelId } : { vendor: "copilot" };
-      let models = await vscode.lm.selectChatModels(selector);
+      const chatResponse = await model.sendRequest(vsCodeMessages, vsCodeOptions, new vscode.CancellationTokenSource().token);
 
-      // If no models found with specific ID, fallback to any copilot model
-      if (models.length === 0 && effectiveModelId) {
-        console.warn(`[CopilotConnect] No model found for ${effectiveModelId}, falling back to default copilot models`);
-        models = await vscode.lm.selectChatModels({ vendor: "copilot" });
-      }
+      const pendingToolCalls: import("./server").ToolCall[] = [];
+      let hasToolCalls = false;
 
-      if (models.length === 0) {
-        throw new Error("[CopilotConnect] No matching language model found");
-      }
-
-      // Ensure we use the correct model - find exact match if modelId specified
-      let selectedModel = models[0];
-      if (effectiveModelId && models.length > 0) {
-        const exactMatch = models.find((m) => m.id === effectiveModelId);
-        if (exactMatch) {
-          selectedModel = exactMatch;
-        } else {
-          console.warn(`[CopilotConnect] StreamChatHandler: No exact match for ${effectiveModelId}, using first model: ${models[0].name}`);
+      for await (const part of chatResponse.stream) {
+        if (part instanceof vscode.LanguageModelTextPart) {
+          onChunk({ content: part.value });
+        } else if (part instanceof vscode.LanguageModelToolCallPart) {
+          hasToolCalls = true;
+          pendingToolCalls.push({
+            id: part.callId,
+            type: "function",
+            function: {
+              name: part.name,
+              arguments: JSON.stringify(part.input),
+            },
+          });
         }
       }
 
-      const [model] = [selectedModel];
-      console.log(`[CopilotConnect] StreamChatHandler: model selected: ${model.id}(${model.name})`);
-
-      const messages = [vscode.LanguageModelChatMessage.User(effectiveContext ? `${effectiveContext}\n\n${prompt}` : prompt)];
-
-      const chatResponse = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
-
-      for await (const fragment of chatResponse.text) {
-        onChunk(fragment);
+      // Emit accumulated tool calls as a single delta chunk
+      if (pendingToolCalls.length > 0) {
+        onChunk({
+          tool_calls: pendingToolCalls.map((tc, idx) => ({
+            index: idx,
+            id: tc.id,
+            type: "function" as const,
+            function: { name: tc.function.name, arguments: tc.function.arguments },
+          })),
+        });
       }
+
+      return {
+        finish_reason: hasToolCalls ? "tool_calls" : "stop",
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
     } catch (err: any) {
       console.error("[CopilotConnect] Stream chat request failed:", err);
       throw err;
@@ -272,10 +445,11 @@ async function startServer(context: vscode.ExtensionContext) {
   };
 
   try {
-    const stopFn = await startBridge(currentPort, modelProvider, chatHandler, streamChatHandler, VERSION);
-    serverDisposable = { dispose: () => stopFn() };
+    bridgeControl = await startBridge(currentPort, modelProvider, chatHandler, streamChatHandler, VERSION);
+    serverDisposable = { dispose: () => bridgeControl!.stop() };
     context.subscriptions.push(serverDisposable!);
     isRunning = true;
+    echoMode = false; // always start in Bridge mode
     updateStatusBar();
     vscode.window.showInformationMessage(`Copilot Connect started on port ${currentPort}`);
   } catch (err: any) {
@@ -297,6 +471,8 @@ function stopServer() {
     serverDisposable.dispose();
     serverDisposable = undefined;
   }
+  bridgeControl = undefined;
+  echoMode = false;
 
   isRunning = false;
   updateStatusBar();
@@ -408,6 +584,29 @@ async function setAdditionalContext() {
   } else {
     vscode.window.showInformationMessage(zh ? "附加上下文已清除" : "Additional context cleared");
   }
+}
+
+function toggleEchoMode() {
+  const config = vscode.workspace.getConfiguration("copilotConnect");
+  const zh = config.get<string>("language", "en") === "zh";
+
+  if (!isRunning || !bridgeControl) {
+    vscode.window.showWarningMessage(zh ? "当前Copilot信使未运行" : "Copilot Connect is not running");
+    return;
+  }
+
+  echoMode = !echoMode;
+  bridgeControl.setEchoMode(echoMode);
+  updateStatusBar();
+
+  const msg = echoMode
+    ? zh
+      ? "Copilot信使已切换到Echo模式"
+      : "Copilot Connect switched to Echo mode"
+    : zh
+      ? "Copilot信使已切换到桥接模式"
+      : "Copilot Connect switched to Bridge mode";
+  vscode.window.showInformationMessage(msg);
 }
 
 async function changeLanguage() {

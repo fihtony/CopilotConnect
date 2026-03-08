@@ -7,12 +7,12 @@ console.log("Note: /models and /chat will return simulated responses.");
 console.log("To get real Copilot responses, run this as a VS Code extension.");
 
 startBridge(port)
-  .then((stopFn) => {
+  .then((bridge) => {
     console.log(`MyBridge running (standalone) on port ${port}`);
 
-    process.on("SIGINT", async () => {
+    process.on("SIGINT", () => {
       console.log("Stopping MyBridge...");
-      await stopFn();
+      bridge.stop();
       process.exit(0);
     });
   })

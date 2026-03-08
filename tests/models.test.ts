@@ -33,7 +33,7 @@ test("v1/models endpoint returns OpenAI-compatible format", async (t) => {
     { id: "gpt-3.5-turbo", name: "GPT-3.5 Turbo", vendor: "copilot" },
   ];
 
-  const stopBridge = await startBridge(TEST_PORT, mockModelProvider);
+  const bridge = await startBridge(TEST_PORT, mockModelProvider);
   const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
 
   try {
@@ -51,7 +51,7 @@ test("v1/models endpoint returns OpenAI-compatible format", async (t) => {
     assert.ok(typeof firstModel.created === "number");
     assert.ok(firstModel.owned_by);
   } finally {
-    await stopBridge();
+    bridge.stop();
   }
 });
 
@@ -61,7 +61,7 @@ test("v1/models endpoint returns fallback models when provider fails", async (t)
     throw new Error("Provider failed");
   };
 
-  const stopBridge = await startBridge(TEST_PORT, mockModelProvider);
+  const bridge = await startBridge(TEST_PORT, mockModelProvider);
   const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
 
   try {
@@ -73,13 +73,13 @@ test("v1/models endpoint returns fallback models when provider fails", async (t)
     assert.ok(data.data.length > 0);
     assert.strictEqual(data.data[0].id, "default");
   } finally {
-    await stopBridge();
+    bridge.stop();
   }
 });
 
 test("v1/models endpoint returns fallback when no provider", async (t) => {
   const TEST_PORT = getTestPort();
-  const stopBridge = await startBridge(TEST_PORT);
+  const bridge = await startBridge(TEST_PORT);
   const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
 
   try {
@@ -90,7 +90,7 @@ test("v1/models endpoint returns fallback when no provider", async (t) => {
     assert.ok(Array.isArray(data.data));
     assert.strictEqual(data.data[0].id, "default");
   } finally {
-    await stopBridge();
+    bridge.stop();
   }
 });
 
@@ -100,7 +100,7 @@ test("v1/models returns correct vendor from provider", async (t) => {
     { id: "test-model", name: "Test Model", vendor: "test-vendor", family: "test-family" },
   ];
 
-  const stopBridge = await startBridge(TEST_PORT, mockModelProvider);
+  const bridge = await startBridge(TEST_PORT, mockModelProvider);
   const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
 
   try {
@@ -110,6 +110,6 @@ test("v1/models returns correct vendor from provider", async (t) => {
     assert.strictEqual(response.status, 200);
     assert.strictEqual(data.data[0].owned_by, "test-vendor");
   } finally {
-    await stopBridge();
+    bridge.stop();
   }
 });
