@@ -1,5 +1,5 @@
 import express from "express";
-import { Request, Response } from "express";
+import { NextFunction, Request, Response } from "express";
 
 // ============================================================
 // Exported Types (OpenAI-compatible)
@@ -107,6 +107,304 @@ export type StreamChatHandler = (
   onChunk: (delta: StreamChunkDelta) => void,
 ) => Promise<{ usage?: UsageInfo; finish_reason?: string }>;
 
+type NormalizedErrorBody = {
+  message: string;
+  type: string;
+  code: string | null;
+  param?: string | null;
+};
+
+type NormalizedError = {
+  status: number;
+  error: NormalizedErrorBody;
+  retryAfterSeconds?: number;
+};
+
+const JSON_BODY_LIMIT = "4mb";
+const MAX_N_CHOICES = 10;
+const SUPPORTED_MESSAGE_ROLES = new Set(["system", "user", "assistant", "tool"]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function createErrorResponse(
+  status: number,
+  message: string,
+  type: string,
+  code: string | null,
+  param?: string | null,
+  retryAfterSeconds?: number,
+): NormalizedError {
+  const error: NormalizedErrorBody = { message, type, code };
+  if (param !== undefined) {
+    error.param = param;
+  }
+  return { status, error, retryAfterSeconds };
+}
+
+function serializeErrorResponse(normalizedError: NormalizedError): { error: NormalizedErrorBody } {
+  return { error: normalizedError.error };
+}
+
+function sendErrorResponse(res: Response, normalizedError: NormalizedError): Response {
+  if (normalizedError.retryAfterSeconds !== undefined) {
+    res.setHeader("Retry-After", String(normalizedError.retryAfterSeconds));
+  }
+  return res.status(normalizedError.status).json(serializeErrorResponse(normalizedError));
+}
+
+function normalizeThrownError(err: unknown): NormalizedError {
+  const message = err instanceof Error ? err.message : typeof err === "string" ? err : "Unexpected server error";
+
+  if (message.includes("Response contained no choices")) {
+    return createErrorResponse(503, message, "upstream_capacity_error", "no_choices", undefined, 10);
+  }
+
+  if (message.includes("Message exceeds token limit")) {
+    return createErrorResponse(400, message, "invalid_request_error", "context_length_exceeded", "messages");
+  }
+
+  if (message.includes("No matching language model found")) {
+    return createErrorResponse(503, message, "upstream_unavailable_error", "no_model_available");
+  }
+
+  return createErrorResponse(500, message, "server_error", null);
+}
+
+function normalizeBodyParserError(err: unknown): NormalizedError | null {
+  if (isRecord(err) && err.type === "entity.too.large") {
+    return createErrorResponse(413, `Request body exceeds the ${JSON_BODY_LIMIT} limit`, "invalid_request_error", "request_too_large");
+  }
+
+  if (err instanceof SyntaxError && isRecord(err) && "body" in err) {
+    return createErrorResponse(400, "Request body must be valid JSON", "invalid_request_error", "invalid_json");
+  }
+
+  return null;
+}
+
+function normalizeMessageContent(
+  content: unknown,
+  paramPath: string,
+): { value?: string | null; error?: NormalizedError } {
+  if (content === null) {
+    return { value: null };
+  }
+
+  if (typeof content === "string") {
+    return { value: content };
+  }
+
+  if (Array.isArray(content)) {
+    const textParts: string[] = [];
+
+    for (let index = 0; index < content.length; index++) {
+      const part = content[index];
+      if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") {
+        return {
+          error: createErrorResponse(
+            400,
+            "Only text content parts are supported in messages[].content arrays",
+            "invalid_request_error",
+            "unsupported_content_type",
+            `${paramPath}[${index}]`,
+          ),
+        };
+      }
+      textParts.push(part.text);
+    }
+
+    return { value: textParts.join("\n") };
+  }
+
+  return {
+    error: createErrorResponse(
+      400,
+      `${paramPath} must be a string, null, or an array of text parts`,
+      "invalid_request_error",
+      "invalid_message_content",
+      paramPath,
+    ),
+  };
+}
+
+function normalizeToolCalls(rawToolCalls: unknown, paramPath: string): { value?: ToolCall[]; error?: NormalizedError } {
+  if (rawToolCalls === undefined) {
+    return {};
+  }
+
+  if (!Array.isArray(rawToolCalls)) {
+    return {
+      error: createErrorResponse(400, `${paramPath} must be an array`, "invalid_request_error", "invalid_tool_calls", paramPath),
+    };
+  }
+
+  const toolCalls: ToolCall[] = [];
+  for (let index = 0; index < rawToolCalls.length; index++) {
+    const rawToolCall = rawToolCalls[index];
+    if (
+      !isRecord(rawToolCall) ||
+      typeof rawToolCall.id !== "string" ||
+      rawToolCall.type !== "function" ||
+      !isRecord(rawToolCall.function) ||
+      typeof rawToolCall.function.name !== "string" ||
+      typeof rawToolCall.function.arguments !== "string"
+    ) {
+      return {
+        error: createErrorResponse(
+          400,
+          `${paramPath}[${index}] must contain id, type="function", and function{name,arguments}`,
+          "invalid_request_error",
+          "invalid_tool_calls",
+          `${paramPath}[${index}]`,
+        ),
+      };
+    }
+
+    toolCalls.push({
+      id: rawToolCall.id,
+      type: "function",
+      function: {
+        name: rawToolCall.function.name,
+        arguments: rawToolCall.function.arguments,
+      },
+    });
+  }
+
+  return { value: toolCalls };
+}
+
+function normalizeMessages(rawMessages: unknown): { messages?: ChatMessage[]; error?: NormalizedError } {
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+    return {
+      error: createErrorResponse(
+        400,
+        "messages is required and must be a non-empty array",
+        "invalid_request_error",
+        null,
+        "messages",
+      ),
+    };
+  }
+
+  const messages: ChatMessage[] = [];
+
+  for (let index = 0; index < rawMessages.length; index++) {
+    const rawMessage = rawMessages[index];
+    const paramPath = `messages[${index}]`;
+
+    if (!isRecord(rawMessage)) {
+      return {
+        error: createErrorResponse(400, `${paramPath} must be an object`, "invalid_request_error", "invalid_message", paramPath),
+      };
+    }
+
+    if (typeof rawMessage.role !== "string" || !SUPPORTED_MESSAGE_ROLES.has(rawMessage.role)) {
+      return {
+        error: createErrorResponse(
+          400,
+          `${paramPath}.role must be one of: system, user, assistant, tool`,
+          "invalid_request_error",
+          "invalid_message_role",
+          `${paramPath}.role`,
+        ),
+      };
+    }
+
+    const normalizedContent = normalizeMessageContent(rawMessage.content, `${paramPath}.content`);
+    if (normalizedContent.error) {
+      return normalizedContent;
+    }
+
+    if ((rawMessage.role === "system" || rawMessage.role === "user" || rawMessage.role === "tool") && normalizedContent.value === null) {
+      return {
+        error: createErrorResponse(
+          400,
+          `${paramPath}.content must be a string for ${rawMessage.role} messages`,
+          "invalid_request_error",
+          "invalid_message_content",
+          `${paramPath}.content`,
+        ),
+      };
+    }
+
+    const normalizedToolCalls = normalizeToolCalls(rawMessage.tool_calls, `${paramPath}.tool_calls`);
+    if (normalizedToolCalls.error) {
+      return normalizedToolCalls;
+    }
+
+    if (rawMessage.role === "tool" && typeof rawMessage.tool_call_id !== "string") {
+      return {
+        error: createErrorResponse(
+          400,
+          `${paramPath}.tool_call_id is required for tool messages`,
+          "invalid_request_error",
+          "invalid_tool_call_id",
+          `${paramPath}.tool_call_id`,
+        ),
+      };
+    }
+
+    const message: ChatMessage = {
+      role: rawMessage.role,
+      content: normalizedContent.value ?? null,
+    };
+
+    if (typeof rawMessage.name === "string") {
+      message.name = rawMessage.name;
+    }
+    if (typeof rawMessage.tool_call_id === "string") {
+      message.tool_call_id = rawMessage.tool_call_id;
+    }
+    if (normalizedToolCalls.value && normalizedToolCalls.value.length > 0) {
+      message.tool_calls = normalizedToolCalls.value;
+    }
+
+    messages.push(message);
+  }
+
+  return { messages };
+}
+
+function validateRequestOptions(options: RequestOptions): NormalizedError | null {
+  if (options.n !== undefined && (!Number.isInteger(options.n) || options.n < 1)) {
+    return createErrorResponse(400, "n must be a positive integer", "invalid_request_error", "invalid_n", "n");
+  }
+
+  if ((options.n ?? 1) > 1 && options.stream) {
+    return createErrorResponse(
+      400,
+      "Streaming requests currently support only n=1",
+      "invalid_request_error",
+      "unsupported_stream_n",
+      "n",
+    );
+  }
+
+  if (
+    options.response_format !== undefined &&
+    (!isRecord(options.response_format) || options.response_format.type !== "json_object")
+  ) {
+    return createErrorResponse(
+      400,
+      'Only response_format.type="json_object" is supported',
+      "invalid_request_error",
+      "unsupported_response_format",
+      "response_format",
+    );
+  }
+
+  if (
+    options.stop !== undefined &&
+    !(typeof options.stop === "string" || (Array.isArray(options.stop) && options.stop.every((value) => typeof value === "string")))
+  ) {
+    return createErrorResponse(400, "stop must be a string or an array of strings", "invalid_request_error", "invalid_stop", "stop");
+  }
+
+  return null;
+}
+
 export async function startBridge(
   port: number,
   modelProvider?: ModelProvider,
@@ -115,7 +413,7 @@ export async function startBridge(
   version?: string,
 ): Promise<BridgeControl> {
   const app = express();
-  app.use(express.json({ limit: "4mb" }));
+  app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
   let echoMode = false;
   let cachedModels: ModelInfo[] = [];
@@ -212,18 +510,12 @@ export async function startBridge(
       user,
     } = body;
 
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({
-        error: {
-          message: "messages is required and must be a non-empty array",
-          type: "invalid_request_error",
-          param: "messages",
-          code: null,
-        },
-      });
+    const normalizedMessages = normalizeMessages(messages);
+    if (normalizedMessages.error) {
+      return sendErrorResponse(res, normalizedMessages.error);
     }
 
-    const modelId: string | null = model || null;
+    const modelId: string | null = typeof model === "string" && model.trim() ? model : null;
 
     // Build RequestOptions with all extracted parameters
     const requestOptions: RequestOptions = {
@@ -245,14 +537,20 @@ export async function startBridge(
       user,
     };
 
+    const requestValidationError = validateRequestOptions(requestOptions);
+    if (requestValidationError) {
+      return sendErrorResponse(res, requestValidationError);
+    }
+
     const chatId = `chatcmpl-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
     const created = Math.floor(Date.now() / 1000);
+    const normalizedRequestMessages = normalizedMessages.messages ?? [];
+    const numChoices = typeof n === "number" && n >= 1 ? Math.min(n, MAX_N_CHOICES) : 1;
 
     // ---- ECHO MODE ----
     if (echoMode) {
-      const lastUserMsg = (messages as ChatMessage[]).filter((m) => m.role === "user").pop();
+      const lastUserMsg = normalizedRequestMessages.filter((m) => m.role === "user").pop();
       const echoContent = `[Echo] ${lastUserMsg?.content ?? "(no user message)"}`;
-      const numEchoChoices = typeof n === "number" && n >= 1 ? Math.min(n, 10) : 1;
 
       if (stream) {
         res.setHeader("Content-Type", "text/event-stream");
@@ -278,7 +576,7 @@ export async function startBridge(
         res.write("data: [DONE]\n\n");
         res.end();
       } else {
-        const echoChoices = Array.from({ length: numEchoChoices }, (_, i) => ({
+        const echoChoices = Array.from({ length: numChoices }, (_, i) => ({
           index: i,
           message: { role: "assistant", content: echoContent },
           finish_reason: "stop",
@@ -297,9 +595,7 @@ export async function startBridge(
 
     // ---- STREAMING ----
     if (stream) {
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
+      let streamStarted = false;
 
       const writeSSE = (choices: object[], usageData?: UsageInfo) => {
         const chunk: Record<string, unknown> = {
@@ -315,15 +611,27 @@ export async function startBridge(
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       };
 
+      const ensureStreamStarted = () => {
+        if (streamStarted) {
+          return;
+        }
+
+        streamStarted = true;
+        res.status(200);
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        writeSSE([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]);
+      };
+
       if (streamChatHandler) {
         try {
-          // Emit role-only opening chunk (OpenAI convention)
-          writeSSE([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]);
-
-          const streamResult = await streamChatHandler(messages as ChatMessage[], modelId, requestOptions, (delta: StreamChunkDelta) => {
+          const streamResult = await streamChatHandler(normalizedRequestMessages, modelId, requestOptions, (delta: StreamChunkDelta) => {
+            ensureStreamStarted();
             writeSSE([{ index: 0, delta, finish_reason: null }]);
           });
 
+          ensureStreamStarted();
           const finishReason = streamResult?.finish_reason || "stop";
           writeSSE([{ index: 0, delta: {}, finish_reason: finishReason }]);
 
@@ -335,15 +643,20 @@ export async function startBridge(
           res.write("data: [DONE]\n\n");
           res.end();
         } catch (err: any) {
-          res.write(`data: ${JSON.stringify({ error: { message: err.message, type: "server_error", code: null } })}\n\n`);
+          const normalizedError = normalizeThrownError(err);
+          if (!streamStarted) {
+            return sendErrorResponse(res, normalizedError);
+          }
+
+          res.write(`data: ${JSON.stringify(serializeErrorResponse(normalizedError))}\n\n`);
           res.end();
         }
       } else {
         // Fallback simulated streaming (no real handler registered)
-        const lastUserMsg = (messages as ChatMessage[]).filter((m) => m.role === "user").pop();
+        const lastUserMsg = normalizedRequestMessages.filter((m) => m.role === "user").pop();
         const lines = [`Echo (stream): ${lastUserMsg?.content || "(no user message)"}`];
 
-        writeSSE([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]);
+        ensureStreamStarted();
         for (const line of lines) {
           writeSSE([{ index: 0, delta: { content: line }, finish_reason: null }]);
           await new Promise((r) => setTimeout(r, 50));
@@ -356,15 +669,13 @@ export async function startBridge(
     }
 
     // ---- NON-STREAMING ----
-    const numChoices = typeof n === "number" && n >= 1 ? Math.min(n, 10) : 1;
-
     if (chatHandler) {
       try {
         const choices: object[] = [];
         let aggregatedUsage: UsageInfo = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
         for (let i = 0; i < numChoices; i++) {
-          const result = await chatHandler(messages as ChatMessage[], modelId, requestOptions);
+          const result = await chatHandler(normalizedRequestMessages, modelId, requestOptions);
 
           const choice: Record<string, unknown> = {
             index: i,
@@ -399,17 +710,11 @@ export async function startBridge(
         });
       } catch (err: any) {
         console.error("Chat handler error:", err.message);
-        return res.status(500).json({
-          error: {
-            message: err.message,
-            type: "server_error",
-            code: null,
-          },
-        });
+        return sendErrorResponse(res, normalizeThrownError(err));
       }
     } else {
       // Fallback echo response (no handler registered)
-      const lastUserMsg = (messages as ChatMessage[]).filter((m) => m.role === "user").pop();
+      const lastUserMsg = normalizedRequestMessages.filter((m) => m.role === "user").pop();
       const echoContent = `Echo: ${lastUserMsg?.content || "(no user message)"}`;
       const choices = Array.from({ length: numChoices }, (_, i) => ({
         index: i,
@@ -425,6 +730,13 @@ export async function startBridge(
         choices,
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       });
+    }
+  });
+
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const normalizedError = normalizeBodyParserError(err) ?? normalizeThrownError(err);
+    if (!res.headersSent) {
+      sendErrorResponse(res, normalizedError);
     }
   });
 
