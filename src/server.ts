@@ -165,6 +165,13 @@ function normalizeThrownError(err: unknown): NormalizedError {
     return createErrorResponse(400, message, "invalid_request_error", "context_length_exceeded", "messages");
   }
 
+  // Copilot LM API throws "Response too long." when the generated output exceeds the
+  // model's response-length limit. Map to 400 so clients know to reduce context or
+  // expected output size. (In OpenAI this surfaces as finish_reason:"length".)
+  if (message.includes("Response too long")) {
+    return createErrorResponse(400, message, "invalid_request_error", "response_too_long");
+  }
+
   if (message.includes("No matching language model found")) {
     return createErrorResponse(503, message, "upstream_unavailable_error", "no_model_available");
   }
