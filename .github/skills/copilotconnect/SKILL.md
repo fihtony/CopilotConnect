@@ -213,14 +213,14 @@ console.log(response.choices[0].message.content);
 | --- | --- | --- |
 | `model` | Supported | Routes to the matching Copilot model when available; otherwise falls back to a Copilot default. |
 | `messages` | Supported | `string` content is supported. Content arrays are supported only for text parts. |
-| `stream` | Supported | SSE stream for a single choice. |
+| `stream` | Supported | SSE stream for a single choice. Streaming requests must use `n=1`. |
 | `stream_options.include_usage` | Supported | Adds a final usage chunk before `[DONE]`. Token counts remain `0`. |
-| `n` | Partial | Non-streaming only. `stream: true` currently supports only `n=1`. |
-| `response_format` | Partial | Only `{ "type": "json_object" }` is supported. In JSON mode, CopilotConnect strips Markdown fences when upstream wraps valid JSON in ```json blocks. |
+| `n` | Partial | Non-streaming only. `n > 1` returns multiple choices, but `stream: true` currently supports only `n=1`. |
+| `response_format` | Partial | Only `{ "type": "json_object" }` is supported. `json_schema` / structured outputs are not supported. |
 | `tools` | Supported | Tool-calling is supported on all models. |
 | `tool_choice: "auto" | "required" | "none"` | Partial | These values are supported. |
 | `tool_choice` with a specific function name | Partial | The VS Code LM API cannot strictly force a named tool. Specific-tool requests degrade to auto-selection behavior. |
-| `max_tokens`, `max_completion_tokens` | Partial | Forwarded upstream, but exact behavior is model-dependent. Very small limits can still trigger upstream `no_choices` failures instead of a clean `length` stop. |
+| `max_tokens`, `max_completion_tokens` | Partial | Forwarded upstream, but exact behavior is model-dependent. Very small limits can still trigger upstream `no_choices` failures, especially on some models, instead of a clean `length` stop. |
 | `temperature`, `top_p`, `stop` | Partial | Forwarded, but GitHub Copilot may ignore or only weakly honor them. |
 | `seed`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `user` | Compatibility only | Accepted for OpenAI compatibility, but not reliably honored by the VS Code LM API / GitHub Copilot. |
 
@@ -233,11 +233,32 @@ These are important when a third-party app uses CopilotConnect in place of OpenA
 | Exact token usage is unavailable | VS Code LM API | `usage.prompt_tokens`, `completion_tokens`, and `total_tokens` are returned as `0`. |
 | System role is not first-class | VS Code LM API | CopilotConnect folds `system` instructions into the prompt it sends upstream. |
 | Exact context windows are not exposed | GitHub Copilot + VS Code LM API | CopilotConnect cannot pre-compute reliable per-model token limits. Oversized requests fail only after upstream validation. |
+| Very small output limits can still fail upstream | VS Code LM API / model behavior | Some models return `503 no_choices` instead of a clean truncated completion when `max_tokens` or `max_completion_tokens` is very small. |
 | Image/audio content parts are unsupported | Current bridge + VS Code LM API | `messages[].content` arrays must contain text parts only. |
 | Forced named tool selection is unsupported | VS Code LM API | `tool_choice` with a specific function name cannot be enforced precisely. |
 | Streaming multi-choice is unsupported | Current bridge design | `stream: true` supports only one choice per request. |
 
 ## Expected Error Cases
+
+### `400 response_too_long`
+
+Example response:
+
+```json
+{
+  "error": {
+    "message": "Response too long.",
+    "type": "invalid_request_error",
+    "code": "response_too_long"
+  }
+}
+```
+
+Meaning:
+
+- The request exceeded what the upstream bridge can safely return.
+- CopilotConnect maps this to a controlled `400` instead of letting it surface as an unhandled server error.
+- Clients should treat it as a hard limit, not as a retryable capacity condition.
 
 ### `503 upstream_capacity_error` / `no_choices`
 
@@ -285,6 +306,10 @@ Meaning:
 ### `503 upstream_unavailable_error` / `no_model_available`
 
 This usually means VS Code has no accessible Copilot model in the current session.
+
+## Key Compatibility Rule
+
+The most important practical rule is: for streaming requests, keep `n=1`. If you need multiple candidates, use non-streaming requests with `n > 1` and handle model-dependent limits and `503 no_choices` behavior.
 
 ## Echo Mode
 
