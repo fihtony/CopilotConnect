@@ -714,3 +714,95 @@ test("v1/chat/completions fallback echo when no handler", async (t) => {
     bridge.stop();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Temperature and top_p validation
+// ---------------------------------------------------------------------------
+
+test("v1/chat/completions rejects temperature > 2", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+      temperature: 3,
+    });
+    const data = await response.json();
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "invalid_temperature");
+    assert.ok(data.error.message.includes("temperature"));
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions rejects temperature < 0", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+      temperature: -0.5,
+    });
+    const data = await response.json();
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "invalid_temperature");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions accepts temperature at boundaries (0 and 2)", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    for (const temp of [0, 1, 2]) {
+      const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+        messages: [{ role: "user", content: "Hello" }],
+        temperature: temp,
+      });
+      // With no chat handler, echo mode returns 200
+      assert.strictEqual(response.status, 200, `temperature=${temp} should be accepted`);
+    }
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions rejects top_p > 1", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+      top_p: 1.5,
+    });
+    const data = await response.json();
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "invalid_top_p");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions accepts top_p at boundaries (0 and 1)", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    for (const top_p of [0, 0.5, 1]) {
+      const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+        messages: [{ role: "user", content: "Hello" }],
+        top_p,
+      });
+      assert.strictEqual(response.status, 200, `top_p=${top_p} should be accepted`);
+    }
+  } finally {
+    bridge.stop();
+  }
+});
+

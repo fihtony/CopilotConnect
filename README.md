@@ -174,4 +174,4 @@ Tony Xu — tony@tarch.ca
 
 ## Version
 
-1.3.1
+1.3.4

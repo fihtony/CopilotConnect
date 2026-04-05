@@ -169,6 +169,13 @@ function normalizeThrownError(err: unknown): NormalizedError {
     return createErrorResponse(503, message, "upstream_unavailable_error", "no_model_available");
   }
 
+  // Upstream returned a 4xx validation error (e.g. temperature out of range).
+  // Map to 400 so callers see an invalid_request_error rather than a 500.
+  const upstreamFailMatch = /^Request Failed: (4\d\d)\b/.exec(message);
+  if (upstreamFailMatch) {
+    return createErrorResponse(400, message, "invalid_request_error", "upstream_validation_error");
+  }
+
   return createErrorResponse(500, message, "server_error", null);
 }
 
@@ -380,6 +387,36 @@ function validateRequestOptions(options: RequestOptions): NormalizedError | null
       "unsupported_stream_n",
       "n",
     );
+  }
+
+  // temperature must be in [0, 2] — matches the OpenAI spec and the GitHub Copilot LM API limit.
+  // Validate here so callers get a clean 400 rather than a VS Code LM API error.
+  if (options.temperature !== undefined) {
+    if (typeof options.temperature !== "number" || isNaN(options.temperature)) {
+      return createErrorResponse(400, "temperature must be a number", "invalid_request_error", "invalid_temperature", "temperature");
+    }
+    if (options.temperature < 0 || options.temperature > 2) {
+      return createErrorResponse(
+        400,
+        `Invalid 'temperature': decimal above maximum value. Expected a value <= 2, but got ${options.temperature} instead.`,
+        "invalid_request_error",
+        "invalid_temperature",
+        "temperature",
+      );
+    }
+  }
+
+  // top_p must be in [0, 1]
+  if (options.top_p !== undefined) {
+    if (typeof options.top_p !== "number" || isNaN(options.top_p) || options.top_p < 0 || options.top_p > 1) {
+      return createErrorResponse(
+        400,
+        "Invalid 'top_p': must be a number in the range [0, 1].",
+        "invalid_request_error",
+        "invalid_top_p",
+        "top_p",
+      );
+    }
   }
 
   if (

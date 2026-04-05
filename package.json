@@ -2,7 +2,7 @@
   "name": "copilot-connect",
   "displayName": "Copilot Connect (Copilot信使)",
   "description": "A local HTTP bridge to GitHub Copilot with OpenAI-compatible API endpoints.",
-  "version": "1.3.2",
+  "version": "1.3.5",
   "publisher": "tonyxu",
   "author": {
     "name": "Tony Xu",
