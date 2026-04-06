@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import { startBridge } from "../dist/server.js";
-import type { ChatMessage, RequestOptions, ChatResult } from "../dist/server.js";
+import type { ChatMessage, RequestOptions, ChatResult } from "../src/server";
 
 // Each test file gets a unique port range
 let testPort = 1420;
@@ -25,6 +25,20 @@ async function makeRequest(baseUrl: string, path: string, method = "GET", body?:
 
   const response = await fetch(url, options);
   return response;
+}
+
+async function makeRawRequest(
+  baseUrl: string,
+  path: string,
+  method: string,
+  rawBody: string,
+  headers: Record<string, string> = { "Content-Type": "application/json" },
+) {
+  return fetch(`${baseUrl}${path}`, {
+    method,
+    headers,
+    body: rawBody,
+  });
 }
 
 test("v1/chat/completions requires messages array", async (t) => {
@@ -117,6 +131,61 @@ test("v1/chat/completions passes full messages array to handler", async (t) => {
     assert.strictEqual(receivedMessages[0].content, "You are a helpful assistant");
     assert.strictEqual(receivedMessages[1].role, "user");
     assert.strictEqual(receivedMessages[1].content, "Hello");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions normalizes text-part message arrays", async () => {
+  const TEST_PORT = getTestPort();
+  let receivedMessages: ChatMessage[] = [];
+
+  const mockChatHandler = async (messages: ChatMessage[]): Promise<ChatResult> => {
+    receivedMessages = messages;
+    return { content: "Response", finish_reason: "stop" };
+  };
+
+  const bridge = await startBridge(TEST_PORT, undefined, mockChatHandler);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Line one" },
+            { type: "text", text: "Line two" },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(receivedMessages[0].content, "Line one\nLine two");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions rejects unsupported message content parts", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: "https://example.com/image.png" } }],
+        },
+      ],
+    });
+    const data = await response.json();
+
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "unsupported_content_type");
   } finally {
     bridge.stop();
   }
@@ -314,6 +383,25 @@ test("v1/chat/completions passes response_format to handler", async (t) => {
   }
 });
 
+test("v1/chat/completions rejects unsupported response_format types", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Return JSON" }],
+      response_format: { type: "json_schema" },
+    });
+    const data = await response.json();
+
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "unsupported_response_format");
+  } finally {
+    bridge.stop();
+  }
+});
+
 test("v1/chat/completions handles streaming requests", async (t) => {
   const TEST_PORT = getTestPort();
   const mockStreamChatHandler = async (
@@ -411,6 +499,26 @@ test("v1/chat/completions streaming with stream_options.include_usage", async (t
   }
 });
 
+test("v1/chat/completions rejects streaming requests with n greater than 1", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+      stream: true,
+      n: 2,
+    });
+    const data = await response.json();
+
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "unsupported_stream_n");
+  } finally {
+    bridge.stop();
+  }
+});
+
 test("v1/chat/completions streaming passes tool_calls delta", async (t) => {
   const TEST_PORT = getTestPort();
   const mockStreamChatHandler = async (
@@ -476,6 +584,54 @@ test("v1/chat/completions returns error when handler fails", async (t) => {
   }
 });
 
+test("v1/chat/completions maps token-limit errors to context_length_exceeded", async () => {
+  const TEST_PORT = getTestPort();
+  const mockChatHandler = async (): Promise<ChatResult> => {
+    throw new Error("Message exceeds token limit.");
+  };
+
+  const bridge = await startBridge(TEST_PORT, undefined, mockChatHandler);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+    });
+    const data = await response.json();
+
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.type, "invalid_request_error");
+    assert.strictEqual(data.error.code, "context_length_exceeded");
+    assert.strictEqual(data.error.param, "messages");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions maps no-choices errors to upstream capacity failures", async () => {
+  const TEST_PORT = getTestPort();
+  const mockChatHandler = async (): Promise<ChatResult> => {
+    throw new Error("Response contained no choices.");
+  };
+
+  const bridge = await startBridge(TEST_PORT, undefined, mockChatHandler);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+    });
+    const data = await response.json();
+
+    assert.strictEqual(response.status, 503);
+    assert.strictEqual(response.headers.get("retry-after"), "10");
+    assert.strictEqual(data.error.type, "upstream_capacity_error");
+    assert.strictEqual(data.error.code, "no_choices");
+  } finally {
+    bridge.stop();
+  }
+});
+
 test("v1/chat/completions streaming handles errors", async (t) => {
   const TEST_PORT = getTestPort();
   const mockStreamChatHandler = async (): Promise<{ finish_reason?: string }> => {
@@ -499,6 +655,48 @@ test("v1/chat/completions streaming handles errors", async (t) => {
   }
 });
 
+test("v1/chat/completions streaming returns JSON errors before the stream starts", async () => {
+  const TEST_PORT = getTestPort();
+  const mockStreamChatHandler = async (): Promise<{ finish_reason?: string }> => {
+    throw new Error("Response contained no choices.");
+  };
+
+  const bridge = await startBridge(TEST_PORT, undefined, undefined, mockStreamChatHandler);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+      stream: true,
+    });
+    const data = await response.json();
+
+    assert.strictEqual(response.status, 503);
+    assert.strictEqual(data.error.type, "upstream_capacity_error");
+    assert.strictEqual(data.error.code, "no_choices");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions returns JSON for invalid request bodies", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+
+  try {
+    const response = await makeRawRequest(baseUrl, "/v1/chat/completions", "POST", '{"messages":[}', {
+      "Content-Type": "application/json",
+    });
+    const data = await response.json();
+
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "invalid_json");
+  } finally {
+    bridge.stop();
+  }
+});
+
 test("v1/chat/completions fallback echo when no handler", async (t) => {
   const TEST_PORT = getTestPort();
   const bridge = await startBridge(TEST_PORT);
@@ -516,3 +714,95 @@ test("v1/chat/completions fallback echo when no handler", async (t) => {
     bridge.stop();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Temperature and top_p validation
+// ---------------------------------------------------------------------------
+
+test("v1/chat/completions rejects temperature > 2", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+      temperature: 3,
+    });
+    const data = await response.json();
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "invalid_temperature");
+    assert.ok(data.error.message.includes("temperature"));
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions rejects temperature < 0", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+      temperature: -0.5,
+    });
+    const data = await response.json();
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "invalid_temperature");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions accepts temperature at boundaries (0 and 2)", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    for (const temp of [0, 1, 2]) {
+      const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+        messages: [{ role: "user", content: "Hello" }],
+        temperature: temp,
+      });
+      // With no chat handler, echo mode returns 200
+      assert.strictEqual(response.status, 200, `temperature=${temp} should be accepted`);
+    }
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions rejects top_p > 1", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+      messages: [{ role: "user", content: "Hello" }],
+      top_p: 1.5,
+    });
+    const data = await response.json();
+    assert.strictEqual(response.status, 400);
+    assert.strictEqual(data.error.code, "invalid_top_p");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("v1/chat/completions accepts top_p at boundaries (0 and 1)", async () => {
+  const TEST_PORT = getTestPort();
+  const bridge = await startBridge(TEST_PORT);
+  const baseUrl = `http://127.0.0.1:${TEST_PORT}`;
+  try {
+    for (const top_p of [0, 0.5, 1]) {
+      const response = await makeRequest(baseUrl, "/v1/chat/completions", "POST", {
+        messages: [{ role: "user", content: "Hello" }],
+        top_p,
+      });
+      assert.strictEqual(response.status, 200, `top_p=${top_p} should be accepted`);
+    }
+  } finally {
+    bridge.stop();
+  }
+});
+

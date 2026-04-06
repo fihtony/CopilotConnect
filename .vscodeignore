@@ -1,0 +1,67 @@
+# -----------------------------------------------------------------------
+# VS Code Extension packaging — files to EXCLUDE from the .vsix bundle.
+# Everything NOT listed here will be included. The VSIX must contain:
+#   dist/extension.js   (main entry point)
+#   dist/server.js      (required by extension.js at runtime)
+#   images/icon.png     (marketplace icon)
+#   package.json        (extension manifest)
+#   README.md           (marketplace listing)
+#   LICENSE.md          (license — required by VS Code marketplace)
+#   node_modules/express (production runtime dependency)
+# -----------------------------------------------------------------------
+
+# Version-control and editor metadata
+.vscode/
+.git/
+.gitignore
+.vscodeignore
+.idea/
+.DS_Store
+Thumbs.db
+
+# CI / GitHub configuration
+.github/
+
+# Source TypeScript — compiled output is in dist/
+src/
+
+# Tests and fixtures (not part of the extension runtime)
+tests/
+
+# Documentation (README.md is included; extended docs are not needed)
+docs/
+
+# Build configuration
+tsconfig.json
+*.tsbuildinfo
+
+# Package manager lockfiles (package.json itself is required)
+package-lock.json
+yarn.lock
+
+# Development-only scripts
+scripts/
+
+# Skill and internal documentation (not part of the extension)
+SKILL.md
+
+# Compiled source-map files (not needed at runtime)
+dist/*.map
+
+# The standalone dev runner — only used outside VS Code
+dist/server-runner.js
+
+# Packaged bundles that end up in the workspace
+*.vsix
+
+# Temporary and generated files
+*.log
+*.tmp
+*.bak
+*~
+.env
+out/
+venv/
+.venv/
+.nyc_output/
+

@@ -1,6 +1,5 @@
 # Dependencies
 node_modules/
-package-lock.json
 
 # Build output
 dist/
@@ -9,6 +8,7 @@ out/
 .env
 venv/
 .venv/
+docs/
 
 
 # Logs
@@ -29,6 +29,7 @@ Thumbs.db
 # Test artifacts
 .nyc_output/
 coverage/
+tests/
 
 # Temporary files
 *.tmp

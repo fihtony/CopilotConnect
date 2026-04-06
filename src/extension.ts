@@ -298,7 +298,27 @@ async function startServer(context: vscode.ExtensionContext) {
       }
     }
 
+    if (pendingSystem.length > 0) {
+      result.unshift(vscode.LanguageModelChatMessage.User(pendingSystem.join("\n\n")));
+    }
+
     return result;
+  }
+
+  function normalizeJsonObjectContent(content: string | null, responseFormat?: { type: string }): string | null {
+    if (responseFormat?.type !== "json_object" || content == null) {
+      return content;
+    }
+
+    const trimmed = content.trim();
+    const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    const candidate = (fencedMatch?.[1] ?? trimmed).trim();
+
+    try {
+      return JSON.stringify(JSON.parse(candidate));
+    } catch {
+      return content;
+    }
   }
 
   /**
@@ -344,49 +364,85 @@ async function startServer(context: vscode.ExtensionContext) {
     return vsCodeOpts;
   }
 
+  /**
+   * Retry helper with exponential back-off for GitHub Copilot rate-limit errors.
+   * When the VS Code LM API returns "Response contained no choices", Copilot is
+   * throttling the request. We wait and retry up to MAX_ATTEMPTS times before
+   * propagating the error to the HTTP layer.
+   */
+  async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    const MAX_ATTEMPTS = 3;
+    const RETRY_DELAYS_MS = [2000, 5000, 10000];
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        const isNoChoices =
+          typeof err?.message === "string" && err.message.includes("Response contained no choices");
+        if (isNoChoices && attempt < MAX_ATTEMPTS - 1) {
+          const delayMs = RETRY_DELAYS_MS[attempt] ?? 10000;
+          console.warn(
+            `[CopilotConnect] ${label}: upstream rate-limited ("no choices"), retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`,
+          );
+          await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error(`${label}: unexpected exit from retry loop`);
+  }
+
   // Chat handler using VS Code Language Model API
   const chatHandler = async (
     messages: ChatMessage[],
     modelId: string | null,
     options: RequestOptions,
   ): Promise<import("./server").ChatResult> => {
-    try {
-      const model = await resolveModel(modelId);
-      const vsCodeMessages = convertMessages(messages, additionalContext || undefined, options.response_format);
-      const vsCodeOptions = buildVsCodeOptions(options);
+    return withRetry("chatHandler", async () => {
+      try {
+        const model = await resolveModel(modelId);
+        const vsCodeMessages = convertMessages(messages, additionalContext || undefined, options.response_format);
+        const vsCodeOptions = buildVsCodeOptions(options);
 
-      const chatResponse = await model.sendRequest(vsCodeMessages, vsCodeOptions, new vscode.CancellationTokenSource().token);
+        const cancellation = new vscode.CancellationTokenSource();
+        const chatResponse = await model.sendRequest(vsCodeMessages, vsCodeOptions, cancellation.token);
 
-      let content = "";
-      const toolCalls: import("./server").ToolCall[] = [];
-      let toolCallIndex = 0;
+        let content = "";
+        const toolCalls: import("./server").ToolCall[] = [];
 
-      for await (const part of chatResponse.stream) {
-        if (part instanceof vscode.LanguageModelTextPart) {
-          content += part.value;
-        } else if (part instanceof vscode.LanguageModelToolCallPart) {
-          toolCalls.push({
-            id: part.callId,
-            type: "function",
-            function: {
-              name: part.name,
-              arguments: JSON.stringify(part.input),
-            },
-          });
-          toolCallIndex++;
+        try {
+          for await (const part of chatResponse.stream) {
+            if (part instanceof vscode.LanguageModelTextPart) {
+              content += part.value;
+            } else if (part instanceof vscode.LanguageModelToolCallPart) {
+              toolCalls.push({
+                id: part.callId,
+                type: "function",
+                function: {
+                  name: part.name,
+                  arguments: JSON.stringify(part.input),
+                },
+              });
+            }
+          }
+        } finally {
+          cancellation.dispose();
         }
-      }
 
-      const result: import("./server").ChatResult = {
-        content: content || null,
-        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
-      };
-      if (toolCalls.length > 0) result.tool_calls = toolCalls;
-      return result;
-    } catch (err: any) {
-      console.error("[CopilotConnect] Chat request failed:", err);
-      throw err;
-    }
+        const normalizedContent = normalizeJsonObjectContent(content || null, options.response_format);
+
+        const result: import("./server").ChatResult = {
+          content: normalizedContent,
+          finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
+        };
+        if (toolCalls.length > 0) result.tool_calls = toolCalls;
+        return result;
+      } catch (err: any) {
+        console.error("[CopilotConnect] Chat request failed:", err);
+        throw err;
+      }
+    });
   };
 
   // Stream chat handler using VS Code Language Model API
@@ -396,52 +452,73 @@ async function startServer(context: vscode.ExtensionContext) {
     options: RequestOptions,
     onChunk: (delta: StreamChunkDelta) => void,
   ): Promise<{ usage?: UsageInfo; finish_reason?: string }> => {
-    try {
-      const model = await resolveModel(modelId);
-      const vsCodeMessages = convertMessages(messages, additionalContext || undefined, options.response_format);
-      const vsCodeOptions = buildVsCodeOptions(options);
+    return withRetry("streamChatHandler", async () => {
+      try {
+        const model = await resolveModel(modelId);
+        const vsCodeMessages = convertMessages(messages, additionalContext || undefined, options.response_format);
+        const vsCodeOptions = buildVsCodeOptions(options);
+        const cancellation = new vscode.CancellationTokenSource();
 
-      const chatResponse = await model.sendRequest(vsCodeMessages, vsCodeOptions, new vscode.CancellationTokenSource().token);
+        const chatResponse = await model.sendRequest(vsCodeMessages, vsCodeOptions, cancellation.token);
 
-      const pendingToolCalls: import("./server").ToolCall[] = [];
-      let hasToolCalls = false;
+        const pendingToolCalls: import("./server").ToolCall[] = [];
+        let hasToolCalls = false;
+        const jsonObjectMode = options.response_format?.type === "json_object";
+        let bufferedJsonContent = "";
 
-      for await (const part of chatResponse.stream) {
-        if (part instanceof vscode.LanguageModelTextPart) {
-          onChunk({ content: part.value });
-        } else if (part instanceof vscode.LanguageModelToolCallPart) {
-          hasToolCalls = true;
-          pendingToolCalls.push({
-            id: part.callId,
-            type: "function",
-            function: {
-              name: part.name,
-              arguments: JSON.stringify(part.input),
-            },
+        try {
+          for await (const part of chatResponse.stream) {
+            if (part instanceof vscode.LanguageModelTextPart) {
+              if (jsonObjectMode) {
+                bufferedJsonContent += part.value;
+              } else {
+                onChunk({ content: part.value });
+              }
+            } else if (part instanceof vscode.LanguageModelToolCallPart) {
+              hasToolCalls = true;
+              pendingToolCalls.push({
+                id: part.callId,
+                type: "function",
+                function: {
+                  name: part.name,
+                  arguments: JSON.stringify(part.input),
+                },
+              });
+            }
+          }
+        } finally {
+          cancellation.dispose();
+        }
+
+
+        // Emit accumulated tool calls as a single delta chunk
+        if (pendingToolCalls.length > 0) {
+          onChunk({
+            tool_calls: pendingToolCalls.map((tc, idx) => ({
+              index: idx,
+              id: tc.id,
+              type: "function" as const,
+              function: { name: tc.function.name, arguments: tc.function.arguments },
+            })),
           });
         }
-      }
 
-      // Emit accumulated tool calls as a single delta chunk
-      if (pendingToolCalls.length > 0) {
-        onChunk({
-          tool_calls: pendingToolCalls.map((tc, idx) => ({
-            index: idx,
-            id: tc.id,
-            type: "function" as const,
-            function: { name: tc.function.name, arguments: tc.function.arguments },
-          })),
-        });
-      }
+        if (jsonObjectMode) {
+          const normalizedJsonContent = normalizeJsonObjectContent(bufferedJsonContent || null, options.response_format);
+          if (normalizedJsonContent) {
+            onChunk({ content: normalizedJsonContent });
+          }
+        }
 
-      return {
-        finish_reason: hasToolCalls ? "tool_calls" : "stop",
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-      };
-    } catch (err: any) {
-      console.error("[CopilotConnect] Stream chat request failed:", err);
-      throw err;
-    }
+        return {
+          finish_reason: hasToolCalls ? "tool_calls" : "stop",
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      } catch (err: any) {
+        console.error("[CopilotConnect] Stream chat request failed:", err);
+        throw err;
+      }
+    }); // end withRetry
   };
 
   try {
